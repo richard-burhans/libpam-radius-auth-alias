@@ -1,0 +1,753 @@
+--- /dev/null
++++ b/src/alias.c
+@@ -0,0 +1,19 @@
++#include <stddef.h>
++
++#include "alias.h"
++#include "alias_file.h"
++#include "alias_ldap.h"
++
++void bx_pam_set_alias(bx_pam_alias_t *cfg, char **user, int force_pompt) {
++  cfg->user_alias = bx_pam_alias_file(cfg, *user);
++  if (cfg->user_alias == NULL) {
++    cfg->user_alias = bx_pam_alias_ldap(cfg, *user);
++  }
++
++  if (cfg->user_alias != NULL) {
++    cfg->user_tmp = *user;
++    *user = cfg->user_alias;
++  }
++
++  cfg->saved_force_prompt = force_pompt;
++}
+--- /dev/null
++++ b/src/alias.h
+@@ -0,0 +1,8 @@
++#ifndef BX_PAM_ALIAS_H
++#define BX_PAM_ALIAS_H
++
++#include "util.h"
++
++void bx_pam_set_alias(bx_pam_alias_t *cfg, char **user, int force_prompt);
++
++#endif
+--- /dev/null
++++ b/src/alias_file.c
+@@ -0,0 +1,131 @@
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "alias_file.h"
++
++#define MAX_LINE 256
++
++static char *skip_space(const char *p) {
++  while (*p && isspace(*p)) {
++    p++;
++  }
++
++  return (char *)p;
++}
++
++static char *find_space(const char *p) {
++  while (*p && !isspace(*p)) {
++    p++;
++  }
++
++  return (char *)p;
++}
++
++static char *find_alias(FILE *fp, const char *username, int *has_bx_principal) {
++  char line[MAX_LINE];
++  char *p, *var, *val, *flag;
++  char *user_alias = NULL;
++
++  while (fgets(line, sizeof(line), fp) != NULL) {
++    /* find username */
++    p = skip_space(line);
++    if (*p && *p != '#') {
++      var = p;
++    } else {
++      continue;
++    }
++
++    /* terminate username */
++    p = find_space(p + 1);
++    if (*p && isspace(*p)) {
++      *p = '\0';
++    } else {
++      continue;
++    }
++
++    if (strcmp(var, username) != 0) {
++      continue;
++    }
++
++    /* find alias */
++    p = skip_space(p + 1);
++    if (*p && !isspace(*p)) {
++      val = p;
++    } else {
++      continue;
++    }
++
++    /* terminate alias */
++    p = find_space(p + 1);
++    if (*p && isspace(*p)) {
++      *p = '\0';
++    } else {
++      continue;
++    }
++
++    user_alias = strdup(val);
++
++    /* find has_bx_principal */
++    p = skip_space(p + 1);
++    if (*p && !isspace(*p)) {
++      flag = p;
++    } else {
++      continue;
++    }
++
++    /* terminate has_bx_principal */
++    p = find_space(p + 1);
++    if (*p && isspace(*p)) {
++      *p = '\0';
++    } else {
++      continue;
++    }
++
++    *has_bx_principal = atoi(flag);
++    break;
++  }
++
++  return (user_alias);
++}
++
++static char *get_alias(bx_pam_alias_t *cfg, const char *username,
++                       int *has_bx_principal) {
++  FILE *fp;
++  struct stat st;
++  int fd;
++  char *user_alias = NULL;
++
++  if ((fd = open(cfg->alias_file_pathname, O_RDONLY)) < 0) {
++    return (user_alias);
++  }
++
++  if (fstat(fd, &st) < 0 || (fp = fdopen(fd, "r")) == NULL) {
++    close(fd);
++    return (user_alias);
++  }
++
++  if ((st.st_mode & (S_IRGRP | S_IROTH)) != 0) {
++    fclose(fp);
++    return (user_alias);
++  }
++
++  user_alias = find_alias(fp, username, has_bx_principal);
++  fclose(fp);
++  return (user_alias);
++}
++
++char *bx_pam_alias_file(bx_pam_alias_t *cfg, const char *username) {
++  char *user_alias = NULL;
++  int has_bx_principal = 0;
++
++  if (cfg->alias_file_pathname != NULL) {
++    user_alias = get_alias(cfg, username, &has_bx_principal);
++  }
++
++  return (user_alias);
++}
+--- /dev/null
++++ b/src/alias_file.h
+@@ -0,0 +1,8 @@
++#ifndef BX_PAM_ALIAS_FILE_H
++#define BX_PAM_ALIAS_FILE_H
++
++#include "util.h"
++
++char *bx_pam_alias_file(bx_pam_alias_t *cfg, const char *username);
++
++#endif
+--- /dev/null
++++ b/src/alias_ldap.c
+@@ -0,0 +1,207 @@
++#include <ldap.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "alias_ldap.h"
++
++static char *find_percent_s(char *r) {
++  char *p = NULL;
++  char *q = NULL;
++  char *rv = NULL;
++
++  while (*r && *r != 's') {
++    p = q;
++    q = r++;
++  }
++
++  if (*r && q && *q == '%') {
++    if (p && *p == '%') {
++      do {
++        *q++ = *r++;
++      } while (*q);
++      rv = find_percent_s(p + 2);
++    } else {
++      rv = q;
++    }
++  }
++
++  return (rv);
++}
++
++static char *fill_template(const char *template, const char *value) {
++  char *string, *new_string;
++  char *p, *q, *front, *back;
++  size_t front_len, back_len, value_len, new_string_len;
++
++  if ((string = strndup(template, strlen(template))) == NULL) {
++    return (NULL);
++  }
++
++  value_len = strlen(value);
++  p = string;
++  q = find_percent_s(p);
++
++  if (q != NULL) {
++    front = p;
++    back = q + 2;
++
++    *q = '\0';
++    front_len = strlen(front);
++    back_len = strlen(back);
++    *q = '%';
++
++    new_string_len = front_len + value_len + back_len;
++
++    if ((new_string = (char *)calloc(new_string_len + 1, sizeof(char))) ==
++        NULL) {
++      free(string);
++      return (NULL);
++    }
++
++    strncpy(new_string, front, front_len);
++    strncat(new_string, value, value_len);
++    strncat(new_string, back, back_len);
++
++    free(string);
++    string = new_string;
++  }
++
++  return (string);
++}
++
++static int alias_ldap_bind(LDAP **ldap, const char *uri) {
++  int ldap_version = LDAP_VERSION3;
++  const int ldap_timelimit = 10;
++  struct berval cred = {0, NULL};
++
++  if (ldap_initialize(ldap, uri) != LDAP_SUCCESS) {
++    return (-1);
++  }
++
++  if (ldap_set_option(*ldap, LDAP_OPT_PROTOCOL_VERSION, &ldap_version) !=
++      LDAP_OPT_SUCCESS) {
++    return (-2);
++  }
++
++  if (ldap_set_option(*ldap, LDAP_OPT_TIMELIMIT, &ldap_timelimit) !=
++      LDAP_OPT_SUCCESS) {
++    return (-3);
++  }
++
++  if (ldap_sasl_bind_s(*ldap, NULL, LDAP_SASL_SIMPLE, &cred, NULL, NULL,
++                       NULL) != LDAP_SUCCESS) {
++    return (-4);
++  }
++
++  return (0);
++}
++
++static char *alias_ldap_search(LDAP *ldap, const char *base,
++                               bx_pam_alias_t *cfg) {
++  int scope_int;
++  size_t scope_len = strlen(cfg->alias_ldap_scope);
++  LDAPMessage *res;
++  LDAPMessage *entry;
++  struct berval **bervec;
++  const char *attrs[3] = {cfg->alias_ldap_attr, "bxPrincFlag", NULL};
++  char *user_alias = NULL;
++  char *bx_princ_flag_str = NULL;
++
++  if (strncmp("base", cfg->alias_ldap_scope, scope_len)) {
++    scope_int = LDAP_SCOPE_BASE;
++  } else if (strncmp("one", cfg->alias_ldap_scope, scope_len)) {
++    scope_int = LDAP_SCOPE_ONELEVEL;
++  } else if (strncmp("sub", cfg->alias_ldap_scope, scope_len)) {
++    scope_int = LDAP_SCOPE_SUBTREE;
++  } else {
++    goto exit;
++  }
++
++  if (ldap_search_ext_s(ldap, (char *)base, scope_int,
++                        (char *)cfg->alias_ldap_filter, (char **)attrs, 0, NULL,
++                        NULL, NULL, LDAP_NO_LIMIT, &res) != LDAP_SUCCESS) {
++    goto cleanupA;
++  }
++
++  if (ldap_count_entries(ldap, res) != 1) {
++    goto cleanupA;
++  }
++
++  if ((entry = ldap_first_entry(ldap, res)) == NULL) {
++    goto cleanupA;
++  }
++
++  if ((bervec = ldap_get_values_len(ldap, entry, cfg->alias_ldap_attr)) ==
++      NULL) {
++    goto cleanupA;
++  }
++
++  if (ldap_count_values_len(bervec) != 1) {
++    goto cleanupB;
++  }
++
++  user_alias = strndup(bervec[0]->bv_val, (size_t)bervec[0]->bv_len);
++  ber_bvecfree(bervec);
++
++  if ((bervec = ldap_get_values_len(ldap, entry, "bxPrincFlag")) == NULL) {
++    cfg->has_bx_principal = 0;
++    goto cleanupA;
++  }
++
++  if (ldap_count_values_len(bervec) != 1) {
++    cfg->has_bx_principal = 0;
++    goto cleanupB;
++  }
++
++  bx_princ_flag_str = strndup(bervec[0]->bv_val, (size_t)bervec[0]->bv_len);
++  cfg->has_bx_principal = atoi(bx_princ_flag_str);
++  free(bx_princ_flag_str);
++
++cleanupB:
++  ber_bvecfree(bervec);
++cleanupA:
++  ldap_msgfree(res);
++exit:
++  return (user_alias);
++}
++
++static void alias_ldap_unbind(LDAP *ldap) {
++  ldap_unbind_ext_s(ldap, NULL, NULL);
++}
++
++static char *find_alias(bx_pam_alias_t *cfg, const char *base) {
++  LDAP *ldap;
++  char *user_alias = NULL;
++
++  if (alias_ldap_bind(&ldap, cfg->alias_ldap_uri) == 0) {
++    user_alias = alias_ldap_search(ldap, base, cfg);
++    alias_ldap_unbind(ldap);
++  }
++
++  return (user_alias);
++}
++
++static char *get_alias(bx_pam_alias_t *cfg, const char *username) {
++  char *base;
++  char *user_alias = NULL;
++
++  base = fill_template(cfg->alias_ldap_base, username);
++  if (base != NULL) {
++    user_alias = find_alias(cfg, base);
++    free(base);
++  }
++
++  return (user_alias);
++}
++
++char *bx_pam_alias_ldap(bx_pam_alias_t *cfg, const char *username) {
++  char *user_alias = NULL;
++
++  if (cfg->alias_ldap_uri != NULL && cfg->alias_ldap_base != NULL &&
++      cfg->alias_ldap_scope != NULL && cfg->alias_ldap_filter != NULL &&
++      cfg->alias_ldap_attr != NULL) {
++    user_alias = get_alias(cfg, username);
++  }
++
++  return (user_alias);
++}
+--- /dev/null
++++ b/src/alias_ldap.h
+@@ -0,0 +1,8 @@
++#ifndef BX_PAM_ALIAS_LDAP_H
++#define BX_PAM_ALIAS_LDAP_H
++
++#include "util.h"
++
++char *bx_pam_alias_ldap(bx_pam_alias_t *cfg, const char *username);
++
++#endif
+--- /dev/null
++++ b/src/util.h
+@@ -0,0 +1,23 @@
++#ifndef BX_PAM_UTIL_H
++#define BX_PAM_UTIL_H
++
++#define BUFFER_SIZE 1024
++
++typedef struct bx_pam_alias_t {
++  char *alias_config_pathname;
++  char *alias_file_pathname;
++  char *alias_ldap_uri;
++  char *alias_ldap_base;
++  char *alias_ldap_scope;
++  char *alias_ldap_filter;
++  char *alias_ldap_attr;
++  char *user_tmp;
++  char *user_alias;
++  int saved_force_prompt;
++  int has_bx_principal;
++} bx_pam_alias_t;
++
++void bx_pam_alias_initialize(int argc, const char **argv, bx_pam_alias_t *conf);
++void bx_pam_cleanup(bx_pam_alias_t *conf, char **user);
++
++#endif
+--- /dev/null
++++ b/src/util.c
+@@ -0,0 +1,136 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "util.h"
++
++static void _config_parse(bx_pam_alias_t *conf) {
++  char buffer[BUFFER_SIZE];
++  char var[BUFFER_SIZE];
++  char val[BUFFER_SIZE];
++  char *p;
++  char c;
++  FILE *fp;
++  int line = 0;
++
++  fp = fopen(conf->alias_config_pathname, "r");
++  if (fp == NULL) {
++    return;
++  }
++
++  while (!feof(fp) && (fgets(buffer, sizeof(buffer), fp) != NULL) &&
++         (!ferror(fp))) {
++    line++;
++    p = buffer;
++
++    /*
++     *  Skip whitespace
++     */
++    while ((*p == ' ') || (*p == '\t')) {
++      p++;
++    }
++
++    /*
++     *  Skip blank lines and comments.
++     */
++    if ((*p == '\r') || (*p == '\n') || (*p == '#')) {
++      continue;
++    }
++
++    /*
++     *  Error out if the text is too long.
++     */
++    if (!*p) {
++      break;
++    }
++
++    /*
++     *  Scan the line for data.
++     */
++    if (sscanf(p, "%[^=]%c%[^\n]", var, &c, val) < 2) {
++      continue; /* invalid line */
++    }
++
++    if (c != '=') {
++      continue; /* invalid line */
++    }
++
++    if (strcmp(var, "alias_file_pathname") == 0) {
++      conf->alias_file_pathname = strdup(val);
++    } else if (strcmp(var, "alias_ldap_uri") == 0) {
++      conf->alias_ldap_uri = strdup(val);
++    } else if (strcmp(var, "alias_ldap_base") == 0) {
++      conf->alias_ldap_base = strdup(val);
++    } else if (strcmp(var, "alias_ldap_scope") == 0) {
++      conf->alias_ldap_scope = strdup(val);
++    } else if (strcmp(var, "alias_ldap_filter") == 0) {
++      conf->alias_ldap_filter = strdup(val);
++    } else if (strcmp(var, "alias_ldap_attr") == 0) {
++      conf->alias_ldap_attr = strdup(val);
++    }
++  }
++
++  fclose(fp);
++}
++
++void bx_pam_alias_initialize(int argc, const char **argv,
++                             bx_pam_alias_t *conf) {
++  /* ensure it's initialized */
++  memset(conf, 0, sizeof(bx_pam_alias_t));
++
++  /*
++   *  If either is not there, then we can't parse anything.
++   */
++  if ((argc == 0) || (argv == NULL)) {
++    return;
++  }
++
++  /* step through arguments */
++  for (; argc-- > 0; ++argv) {
++    /* generic options */
++    if (strncmp(*argv, "alias_conf=", 11) == 0) {
++      conf->alias_config_pathname = (char *)*argv + 11;
++    }
++  }
++
++  _config_parse(conf);
++}
++
++void bx_pam_cleanup(bx_pam_alias_t *conf, char **user) {
++  if (conf->alias_file_pathname != NULL) {
++    free(conf->alias_file_pathname);
++    conf->alias_file_pathname = NULL;
++  }
++
++  if (conf->alias_ldap_uri != NULL) {
++    free(conf->alias_ldap_uri);
++    conf->alias_ldap_uri = NULL;
++  }
++
++  if (conf->alias_ldap_base != NULL) {
++    free(conf->alias_ldap_base);
++    conf->alias_ldap_base = NULL;
++  }
++
++  if (conf->alias_ldap_scope != NULL) {
++    free(conf->alias_ldap_scope);
++    conf->alias_ldap_scope = NULL;
++  }
++
++  if (conf->alias_ldap_filter != NULL) {
++    free(conf->alias_ldap_filter);
++    conf->alias_ldap_filter = NULL;
++  }
++
++  if (conf->alias_ldap_attr != NULL) {
++    free(conf->alias_ldap_attr);
++    conf->alias_ldap_attr = NULL;
++  }
++
++  if (conf->user_alias != NULL) {
++    *user = conf->user_tmp;
++    free(conf->user_alias);
++    conf->user_alias = NULL;
++    conf->user_tmp = NULL;
++  }
++}
+--- a/src/pam_radius_auth.c
++++ b/src/pam_radius_auth.c
+@@ -29,6 +29,7 @@
+ #define PAM_SM_SESSION
+ 
+ #include "pam_radius_auth.h"
++#include "alias.h"
+ 
+ #define DPRINT if (debug) _pam_log
+ 
+@@ -130,6 +131,9 @@
+ 		} else if (!strcmp(*argv, "privilege_level")) {
+ 			conf->privilege_level = TRUE;
+ 
++		} else if (!strncmp(*argv, "alias_conf=", 11)) {
++			(void) 0;
++
+ 		} else {
+ 			_pam_log(LOG_WARNING, "unrecognized option '%s'", *argv);
+ 		}
+@@ -1174,9 +1178,11 @@
+ 	AUTH_HDR *request = (AUTH_HDR *) send_buffer;
+ 	AUTH_HDR *response = (AUTH_HDR *) recv_buffer;
+ 	radius_conf_t config;
++	bx_pam_alias_t alias_config;
+ 
+ 	ctrl = _pam_parse(argc, argv, &config);
+ 	debug = config.debug;
++	bx_pam_alias_initialize(argc, argv, &alias_config);
+ 
+ 	/* grab the user name */
+ 	retval = pam_get_user(pamh, &user, NULL);
+@@ -1231,6 +1237,12 @@
+ 	get_random_vector(request->vector);
+ 	request->id = request->vector[0]; /* this should be evenly distributed */
+ 
++	/* Check for and set alias */
++	bx_pam_set_alias(&alias_config, (char **) &user, config.force_prompt);
++	if (alias_config.has_bx_principal == 1) {
++		config.force_prompt = TRUE;
++	}
++
+ 	/* grab the password (if any) from the previous authentication layer */
+         if (!config.force_prompt) {
+                 DPRINT(LOG_DEBUG, "ignore last_pass, force_prompt set");
+@@ -1364,6 +1376,11 @@
+ 		}
+ 	}
+ 
++	if (alias_config.has_bx_principal == 1) {
++		config.force_prompt = alias_config.saved_force_prompt;
++	}
++	bx_pam_cleanup(&alias_config, (char **) &user);
++
+ 	/* Whew! Done the pasword checks, look for an authentication acknowledge */
+ 	if (response->code == PW_AUTHENTICATION_ACK) {
+ 		retval = PAM_SUCCESS;
+@@ -1484,8 +1501,10 @@
+ 	AUTH_HDR *request = (AUTH_HDR *) send_buffer;
+ 	AUTH_HDR *response = (AUTH_HDR *) recv_buffer;
+ 	radius_conf_t config;
++	bx_pam_alias_t alias_config;
+ 
+ 	(void) _pam_parse(argc, argv, &config);
++	bx_pam_alias_initialize(argc, argv, &alias_config);
+ 
+ 	/* grab the user name */
+ 	retval = pam_get_user(pamh, &user, NULL);
+@@ -1521,6 +1540,12 @@
+ 	get_random_vector(request->vector);
+ 	request->id = request->vector[0]; /* this should be evenly distributed */
+ 
++	/* Check for and set alias */
++	bx_pam_set_alias(&alias_config, (char **) &user, config.force_prompt);
++	if (alias_config.has_bx_principal == 1) {
++		config.force_prompt = TRUE;
++	}
++
+ 	build_radius_packet(request, user, NULL, &config);
+ 
+ 	add_int_attribute(request, PW_ACCT_STATUS_TYPE, status);
+@@ -1605,8 +1630,10 @@
+ 	AUTH_HDR *request = (AUTH_HDR *) send_buffer;
+ 	AUTH_HDR *response = (AUTH_HDR *) recv_buffer;
+ 	radius_conf_t config;
++	bx_pam_alias_t alias_config;
+ 
+ 	ctrl = _pam_parse(argc, argv, &config);
++	bx_pam_alias_initialize(argc, argv, &alias_config);
+ 
+ 	/* grab the user name */
+ 	retval = pam_get_user(pamh, &user, NULL);
+@@ -1667,6 +1694,12 @@
+ 		get_random_vector(request->vector);
+ 		request->id = request->vector[0]; /* this should be evenly distributed */
+ 
++		/* Check for and set alias */
++		bx_pam_set_alias(&alias_config, (char **) &user, config.force_prompt);
++		if (alias_config.has_bx_principal == 1) {
++			config.force_prompt = TRUE;
++		}
++
+ 		build_radius_packet(request, user, password, &config);
+ 		add_int_attribute(request, PW_USER_SERVICE_TYPE, PW_AUTHENTICATE_ONLY);
+ 
+@@ -1770,6 +1803,12 @@
+ 		_pam_forget(config.server->secret);
+ 		config.server->secret = strdup(password); /* it's free'd later */
+ 
++		/* Check for and set alias */
++		bx_pam_set_alias(&alias_config, (char **) &user, config.force_prompt);
++		if (alias_config.has_bx_principal == 1) {
++			config.force_prompt = TRUE;
++		}
++
+ 		build_radius_packet(request, user, new_password, &config);
+ 		add_password(request, PW_OLD_PASSWORD, password, password);
+ 
+@@ -1783,6 +1822,11 @@
+ 		}
+ 	}
+ 
++	if (alias_config.has_bx_principal == 1) {
++		config.force_prompt = alias_config.saved_force_prompt;
++	}
++	bx_pam_cleanup(&alias_config, (char **) &user);
++
+ 	/*
+ 	 * Send the passwords to the next stage if preliminary checks fail,
+ 	 * or if the password change request fails.
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -1,4 +1,4 @@
+-all: pam_radius_auth.o md5.o
++all: pam_radius_auth.o md5.o alias.o alias_file.o alias_ldap.o util.o
+ 
+ pam_radius_auth.o: pam_radius_auth.c pam_radius_auth.h config.h
+ 	$(CC) $(CFLAGS) -c $< -o $@
+@@ -6,6 +6,18 @@
+ md5.o: md5.c md5.h
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
++alias.o: alias.c alias.h
++	$(CC) $(CFLAGS) -c $< -o $@
++
++alias_file.o: alias_file.c alias_file.h
++	$(CC) $(CFLAGS) -c $< -o $@
++
++alias_ldap.o: alias_ldap.c alias_ldap.h
++	$(CC) $(CFLAGS) -c $< -o $@
++
++util.o: util.c util.h
++	$(CC) $(CFLAGS) -c $< -o $@
++
+ .PHONY: clean
+ clean:
+ 	@rm -f *~ *.so *.o src/*.o src/*~
+--- a/Makefile
++++ b/Makefile
+@@ -46,6 +46,18 @@
+ src/md5.o: src/md5.c src/md5.h
+ 	@$(MAKE) -C src $(notdir $@)
+ 
++src/alias.o: src/alias.c src/alias.h
++	@$(MAKE) -C src $(notdir $@)
++
++src/alias_file.o: src/alias_file.c src/alias_file.h
++	@$(MAKE) -C src $(notdir $@)
++
++src/alias_ldap.o: src/alias_ldap.c src/alias_ldap.h
++	@$(MAKE) -C src $(notdir $@)
++
++src/util.o: src/util.c src/util.h
++	@$(MAKE) -C src $(notdir $@)
++
+ #
+ # This is what should work on Irix:
+ #pam_radius_auth.so: pam_radius_auth.o md5.o
+@@ -64,8 +76,8 @@
+ #
+ #	gcc -shared pam_radius_auth.o md5.o -lpam -lc -o pam_radius_auth.so
+ #
+-pam_radius_auth.so: src/pam_radius_auth.o src/md5.o
+-	$(CC) $(LDFLAGS) $^ -lpam -o pam_radius_auth.so
++pam_radius_auth.so: src/pam_radius_auth.o src/md5.o src/alias.o src/alias_file.o src/alias_ldap.o src/util.o
++	$(CC) $(LDFLAGS) $^ -lpam -lldap -o pam_radius_auth.so
+ 
+ ######################################################################
+ #

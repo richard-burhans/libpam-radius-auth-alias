@@ -1,0 +1,30 @@
+Source: libpam-radius-auth
+Maintainer: Carsten Schoenert <c.schoenert@t-online.de>
+Uploaders: Christoph Goehre <chris@sigxcpu.org>
+Section: admin
+Priority: optional
+Standards-Version: 4.2.0
+Build-Depends:
+ debhelper-compat (= 11),
+ libpam0g-dev | libpam-dev,
+ libldap2-dev
+Rules-Requires-Root: no
+Homepage: https://www.freeradius.org/pam_radius_auth/
+Vcs-Browser: https://salsa.debian.org/tijuca/libpam-radius-auth
+Vcs-Git: https://salsa.debian.org/tijuca/libpam-radius-auth.git
+
+Package: libpam-radius-auth
+Architecture: any
+Multi-Arch: same
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Pre-Depends: ${misc:Pre-Depends}
+Suggests:
+ radius-server,
+Description: PAM RADIUS authentication module
+ This is the PAM to RADIUS authentication module. It allows any PAM-capable
+ machine to become a RADIUS client for authentication and accounting
+ requests. You will, however, need to supply your own RADIUS server to
+ perform the actual authentication
+
