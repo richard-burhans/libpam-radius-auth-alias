@@ -1,0 +1,16 @@
+libpam-radius-auth (2.0.0-1~exp1) experimental; urgency=medium
+
+  libpam-radius-auth ships a pam-config file starting on version 2.0.0
+
+  The package provides now a PAM profile under /usr/share/pam-configs/radius
+  which can be used with pam-auth-update.
+  The default standard behavior on package installation is to do nothing as the
+  config key 'Default' is set to 'no'. In case you want to use this config file
+  you need to modify at least this option and call 'pam-auth-update' afterwards.
+
+  More information on the PAM configuration manager can be found in
+  PAM-AUTH-UPDATE(8)
+  or online on site:
+  https://manpages.debian.org/unstable/libpam-runtime/pam-auth-update.8.en.html
+
+ -- Carsten Schoenert <c.schoenert@t-online.de>  Thu, 4 Feb 2021 17:51:00 -0100
